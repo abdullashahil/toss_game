@@ -24,139 +24,138 @@ const ALL_PLAYERS = [
   { id: 20, name: 'Ishant Sharma' }
 ];
 
-// In-memory storage for rooms
+// In-memory storage for rooms: key = roomId, value = { host, users, status, availablePlayers, turnOrder, currentTurnIndex, timer }
 const rooms = new Map();
 
 function registerSocketHandlers(server) {
   const io = socketIo(server, {
-    cors: { origin: '*', methods: ['GET', 'POST'] }
+    cors: { origin: '*', methods: ['GET','POST'] }
   });
 
   io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
-    socket.on('create-room', (username) => createRoom(io, socket, username));
-    socket.on('join-room', (data) => joinRoom(io, socket, data));
-    socket.on('start-selection', (roomId) => startSelection(io, socket, roomId));
-    socket.on('select-player', (data) => selectPlayer(io, socket, data));
-    socket.on('disconnect', () => handleDisconnect(socket, io));
+    // Create room
+    socket.on('create-room', (username) => {
+      const roomId = generateRoomId();
+      rooms.set(roomId, {
+        host: socket.id,
+        users: new Map([[socket.id, { username, players: [] }]]),
+        status: 'waiting',
+        availablePlayers: [...ALL_PLAYERS],
+        turnOrder: [],
+        currentTurnIndex: 0,
+        timer: null
+      });
+      socket.join(roomId);
+      // inform creator
+      socket.emit('room-created', { roomId, hostId: socket.id });
+      // broadcast full user list
+      io.to(roomId).emit('user-list', getUserList(roomId));
+      console.log(`Room ${roomId} created by ${username}`);
+    });
+
+    // Join room
+    socket.on('join-room', ({ roomId, username }) => {
+      const room = rooms.get(roomId);
+      if (!room || room.status !== 'waiting') {
+        socket.emit('error', { message: 'Invalid room or already started' });
+        return;
+      }
+      room.users.set(socket.id, { username, players: [] });
+      socket.join(roomId);
+      // confirm join
+      socket.emit('room-joined', { roomId, hostId: room.host });
+      // broadcast updated user list
+      io.to(roomId).emit('user-list', getUserList(roomId));
+      console.log(`${username} joined room ${roomId}`);
+    });
+
+    // Send available players
+    socket.on('get-players', (roomId) => {
+      const room = rooms.get(roomId);
+      if (room) socket.emit('player-list', room.availablePlayers);
+    });
+
+    // Start selection (only host)
+    socket.on('start-selection', (roomId) => {
+      const room = rooms.get(roomId);
+      if (!room || socket.id !== room.host) return;
+      room.status = 'selection';
+      room.turnOrder = shuffleArray([...room.users.keys()]);
+      room.currentTurnIndex = 0;
+      // notify start and turn order
+      io.to(roomId).emit('selection-started', {
+        turnOrder: room.turnOrder.map(id => ({ userId: id, username: room.users.get(id).username })),
+        currentUserId: room.turnOrder[0]
+      });
+      advanceTurn(io, roomId);
+      console.log(`Selection in room ${roomId} started`);
+    });
+
+    // Player selects
+    socket.on('select-player', ({ roomId, playerId }) => {
+      processSelection(io, roomId, socket.id, playerId, false);
+    });
+
+    // Disconnect cleanup
+    socket.on('disconnect', () => {
+      rooms.forEach((room, roomId) => {
+        if (room.users.has(socket.id)) {
+          room.users.delete(socket.id);
+          io.to(roomId).emit('user-list', getUserList(roomId));
+          console.log(`Removed ${socket.id} from room ${roomId}`);
+        }
+      });
+    });
   });
 }
 
-// Helper: generate unique 5-char room ID
+// Helpers
 function generateRoomId() {
-  return Math.random().toString(36).substring(2, 7).toUpperCase();
+  return Math.random().toString(36).slice(2,7).toUpperCase();
 }
-
-// Helper: shuffle an array
-function shuffleArray(array) {
-  return array.sort(() => Math.random() - 0.5);
+function shuffleArray(arr) {
+  return arr.sort(() => Math.random()-0.5);
 }
-
-function createRoom(io, socket, username) {
-  const roomId = generateRoomId();
-  rooms.set(roomId, {
-    host: socket.id,
-    users: new Map([[socket.id, { username, players: [] }]]),
-    status: 'waiting',
-    availablePlayers: [...ALL_PLAYERS],
-    turnOrder: [],
-    currentTurnIndex: 0,
-    timer: null
-  });
-
-  socket.join(roomId);
-  socket.emit('room-created', { roomId, username });
-  console.log(`Room created: ${roomId} by ${username}`);
-}
-
-function joinRoom(io, socket, data) {
-  const { roomId, username } = data;
+function getUserList(roomId) {
   const room = rooms.get(roomId);
-  if (!room || room.status !== 'waiting') {
-    socket.emit('error', { message: 'Invalid room or game already started' });
-    return;
-  }
-
-  room.users.set(socket.id, { username, players: [] });
-  socket.join(roomId);
-  socket.emit('room-joined', { roomId, username, host: room.host });
-  socket.to(roomId).emit('user-joined', { userId: socket.id, username });
-
-  console.log(`${username} joined room ${roomId}`);
+  if (!room) return [];
+  return Array.from(room.users.entries()).map(([id, u]) => ({ userId: id, username: u.username, isHost: id===room.host }));
 }
 
-function startSelection(io, socket, roomId) {
+function advanceTurn(io, roomId) {
   const room = rooms.get(roomId);
-  if (!room || socket.id !== room.host) return;
-
-  room.turnOrder = shuffleArray(Array.from(room.users.keys()));
-  room.status = 'selection';
-  room.currentTurnIndex = 0;
-
-  io.to(roomId).emit('selection-started', {
-    turnOrder: room.turnOrder.map(id => ({ userId: id, username: room.users.get(id).username }))
-  });
-
-  startTurnTimer(io, roomId);
-  console.log(`Selection started in room ${roomId}`);
-}
-
-function selectPlayer(io, socket, data) {
-  const { roomId, playerId } = data;
-  const room = rooms.get(roomId);
-  if (!room || room.status !== 'selection') return;
-
-  const currentUserId = room.turnOrder[room.currentTurnIndex];
-  if (socket.id !== currentUserId) return;
-
-  processSelection(io, roomId, playerId, false);
-}
-
-function startTurnTimer(io, roomId) {
-  const room = rooms.get(roomId);
-  if (!room || room.status !== 'selection') return;
-
+  if (!room || room.status!=='selection') return;
   if (room.timer) clearTimeout(room.timer);
-
   const currentUserId = room.turnOrder[room.currentTurnIndex];
   io.to(roomId).emit('turn-update', { currentUserId, timeLeft: 10 });
-
   room.timer = setTimeout(() => {
-    const randomPlayer = room.availablePlayers[Math.floor(Math.random() * room.availablePlayers.length)];
-    processSelection(io, roomId, randomPlayer.id, true);
-  }, 10000);
+    const roomRef = rooms.get(roomId);
+    if (!roomRef || !roomRef.availablePlayers.length) return;
+    const rand = roomRef.availablePlayers[Math.floor(Math.random()*roomRef.availablePlayers.length)];
+    processSelection(io, roomId, currentUserId, rand.id, true);
+  },10000);
 }
 
-function processSelection(io, roomId, playerId, isAuto) {
+function processSelection(io, roomId, userId, playerId, isAuto) {
   const room = rooms.get(roomId);
-  const currentUserId = room.turnOrder[room.currentTurnIndex];
-  const user = room.users.get(currentUserId);
-
-  const idx = room.availablePlayers.findIndex(p => p.id === playerId);
-  if (idx === -1) return;
-
-  const [player] = room.availablePlayers.splice(idx, 1);
-  user.players.push(player);
-
-  io.to(roomId).emit('player-selected', { userId: currentUserId, username: user.username, player, isAuto });
-
-  const allDone = Array.from(room.users.values()).every(u => u.players.length === 5);
-  if (allDone) {
-    room.status = 'ended';
-    io.to(roomId).emit('selection-ended', {
-      teams: Array.from(room.users.entries()).map(([id, u]) => ({ userId: id, username: u.username, players: u.players }))
-    });
+  if (!room || room.status!=='selection') return;
+  const current = room.turnOrder[room.currentTurnIndex];
+  if (userId!==current) return;  // not this user's turn
+  const idx = room.availablePlayers.findIndex(p=>p.id===playerId);
+  if (idx<0) return;
+  const [player] = room.availablePlayers.splice(idx,1);
+  room.users.get(userId).players.push(player);
+  io.to(roomId).emit('player-selected',{ userId, username: room.users.get(userId).username, player, isAuto });
+  // next
+  const done = Array.from(room.users.values()).every(u=>u.players.length===5);
+  if (done) {
+    io.to(roomId).emit('selection-ended',{ teams: getUserList(roomId).map(u=>({ userId: u.userId, username: u.username, players: rooms.get(roomId).users.get(u.userId).players })) });
     return;
   }
-
-  room.currentTurnIndex = (room.currentTurnIndex + 1) % room.turnOrder.length;
-  startTurnTimer(io, roomId);
-}
-
-function handleDisconnect(socket, io) {
-  console.log(`Disconnected: ${socket.id}`);
-  // Optional: cleanup empty rooms or notify others
+  room.currentTurnIndex=(room.currentTurnIndex+1)%room.turnOrder.length;
+  advanceTurn(io, roomId);
 }
 
 module.exports = { registerSocketHandlers };
